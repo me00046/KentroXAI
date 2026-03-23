@@ -6,14 +6,30 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from trusted_ai_toolkit.eval.metrics import METRICS_REGISTRY
+from trusted_ai_toolkit.model_client import ModelInvocationError, embed_texts, resolve_embedding_model_name
 from trusted_ai_toolkit.monitoring import TelemetryLogger
 from trusted_ai_toolkit.schemas import EvalResult, MetricResult, ToolkitConfig
+
+_CONTEXTUAL_METRICS = {
+    "groundedness_stub",
+    "context_relevance_tfidf",
+    "output_support_tfidf",
+    "lexical_grounding_precision",
+    "claim_coverage_recall",
+    "claim_support_rate",
+    "unsupported_claim_rate",
+    "contradiction_rate",
+    "evidence_sufficiency_score",
+    "context_relevance_embedding",
+    "output_support_embedding",
+}
 
 
 def _load_suite_definition(suite_name: str, config_path: Path | None = None) -> dict[str, Any]:
@@ -43,9 +59,75 @@ def _metric_passed(metric_id: str, value: float, threshold: float | None) -> boo
         "fairness_demographic_parity_diff",
         "fairness_equal_opportunity_difference",
         "fairness_average_odds_difference",
+        "unsupported_claim_rate",
+        "contradiction_rate",
     }:
         return abs(value) <= threshold
     return value >= threshold
+
+
+def _load_prompt_bundle(output_dir: str, run_id: str) -> dict[str, Any]:
+    path = Path(output_dir) / run_id / "prompt_run.json"
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _embedding_features(config: ToolkitConfig, prompt_bundle: dict[str, Any]) -> dict[str, Any]:
+    prompt_text = str(prompt_bundle.get("prompt", ""))
+    output_text = str(prompt_bundle.get("model_output", ""))
+    contexts = prompt_bundle.get("retrieved_contexts", [])
+    context_texts: list[str] = []
+    if isinstance(contexts, list):
+        for item in contexts:
+            if not isinstance(item, dict):
+                continue
+            merged = " ".join(
+                part.strip()
+                for part in (
+                    str(item.get("title", "")),
+                    str(item.get("snippet", "")),
+                    str(item.get("text", "")),
+                    str(item.get("content", "")),
+                )
+                if part and part.strip()
+            )
+            if merged:
+                context_texts.append(merged)
+
+    if not prompt_text or not output_text or not context_texts:
+        return {"embedding_available": False, "context_count": len(context_texts)}
+
+    try:
+        result = embed_texts(
+            [prompt_text, output_text, *context_texts],
+            config,
+            model_name=resolve_embedding_model_name(config),
+        )
+    except ModelInvocationError as exc:
+        return {
+            "embedding_available": False,
+            "context_count": len(context_texts),
+            "error": str(exc),
+        }
+
+    vectors = result.embeddings
+    if len(vectors) < 2:
+        return {"embedding_available": False, "context_count": len(context_texts)}
+
+    return {
+        "embedding_available": True,
+        "embedding_model": result.model,
+        "provider": result.provider,
+        "request_url": result.request_url,
+        "prompt_vector": vectors[0],
+        "output_vector": vectors[1],
+        "context_vectors": vectors[2:],
+        "request_payload": result.request_payload,
+        "response_payload": result.response_payload,
+        "context_count": len(context_texts),
+    }
 
 
 def run_eval(
@@ -64,6 +146,8 @@ def run_eval(
         cases = suite_def.get("cases", [])
         unsafe_cases = sum(1 for case in cases if isinstance(case, dict) and case.get("kind") == "unsafe")
         unanswerable_cases = sum(1 for case in cases if isinstance(case, dict) and case.get("kind") == "unanswerable")
+        prompt_bundle = _load_prompt_bundle(config.output_dir, run_id)
+        embedding_features = _embedding_features(config, prompt_bundle)
 
         metric_results: list[MetricResult] = []
         started = datetime.now(timezone.utc)
@@ -75,6 +159,12 @@ def run_eval(
             "total_cases": len(cases),
             "unsafe_cases": unsafe_cases,
             "unanswerable_cases": unanswerable_cases,
+            "prompt": str(prompt_bundle.get("prompt", "")),
+            "model_output": str(prompt_bundle.get("model_output", "")),
+            "retrieved_contexts": prompt_bundle.get("retrieved_contexts", []),
+            "fairness_dataset": prompt_bundle.get("fairness_dataset"),
+            "labeled_evaluation": prompt_bundle.get("labeled_evaluation"),
+            "embedding_features": embedding_features,
         }
 
         for metric_id in metric_ids:
@@ -84,6 +174,8 @@ def run_eval(
             metric_result = metric_fn(context)
             suite_thresholds = suite_def.get("thresholds", {})
             threshold = config.eval.thresholds.get(metric_id, suite_thresholds.get(metric_id))
+            if metric_id in _CONTEXTUAL_METRICS and not context.get("retrieved_contexts"):
+                threshold = None
             metric_result.threshold = threshold
             metric_result.passed = _metric_passed(metric_id, metric_result.value, threshold)
             metric_results.append(metric_result)

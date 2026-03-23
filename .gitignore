@@ -14,3 +14,9 @@ __pycache__/
 .DS_Store
 ~$*.docx
 .venv/
+
+# Local secrets
+.env
+.env.local
+.env.*
+!.env.example

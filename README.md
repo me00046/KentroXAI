@@ -39,6 +39,12 @@ tat run prompt --config config.yaml --prompt "Summarize the policy update."
 ```
 
 ```bash
+ollama serve
+ollama pull qwen2.5-coder:3b
+tat run simulate --config config.yaml --prompt "Summarize the policy update."
+```
+
+```bash
 tat demo
 ```
 
@@ -54,6 +60,18 @@ tat demo --open-scorecard
 
 # (Don't paste this comment in terminal)Primary end-to-end run
 tat run prompt --config config.yaml --prompt "Summarize policy controls" --model-output "Stub answer"
+
+# (Don't paste this comment in terminal)Free local-model simulation run
+ollama serve
+ollama pull qwen2.5-coder:3b
+tat run simulate --config config.yaml --prompt "Summarize policy controls"
+
+# (Don't paste this comment in terminal)OpenAI-compatible hosted run if needed
+tat run simulate --config config.yaml --prompt "Summarize policy controls" \
+  --provider openai_compatible \
+  --endpoint https://api.openai.com/v1 \
+  --model gpt-4.1-mini \
+  --request-format responses
 
 # (Don't paste this comment in terminal)Individual workflows
 tat eval run --config config.yaml
@@ -98,8 +116,9 @@ tat redteam run --config tests/redteam/configs/config_rt03.yaml
 
 ## Notes
 
-- No external APIs are required for v0.
-- Adapter contracts include future support for Azure OpenAI.
+- No external APIs are required for stubbed runs or local Ollama simulation runs.
+- `tat init` now bootstraps the adapter for a free local `Ollama` model by default.
+- `tat run simulate` routes across Ollama native generate, OpenAI Responses, and OpenAI-compatible chat completions APIs while keeping the rest of the toolkit in dry-run mode.
 - Golden suites include 50+ deterministic test cases across low, medium, and high tiers.
 - Red-team suite includes 20 deterministic security cases.
 - This repository is public-facing and designed to allow referenced inspiration patterns with explicit attribution.

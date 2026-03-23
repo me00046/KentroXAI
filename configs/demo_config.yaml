@@ -41,6 +41,7 @@ model:
 eval:
   suites:
     - medium
+  benchmark_registry_path: benchmarks/metric_registry.json
   thresholds:
     accuracy_stub: 0.75
     reliability: 0.8

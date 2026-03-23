@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,13 @@ def build_lineage_report(store: ArtifactStore) -> LineageReport:
                 title=str(item.get("title", f"Context Source {idx}")),
                 uri=item.get("uri"),
                 used_for=str(item.get("used_for", "retrieval grounding")),
+                content_hash=hashlib.sha256(merged.encode("utf-8")).hexdigest() if (merged := " ".join(
+                    str(item.get(key, "")).strip() for key in ("title", "snippet", "text", "content") if str(item.get(key, "")).strip()
+                )) else None,
+                metadata={
+                    "source": item.get("source"),
+                    "snippet": item.get("snippet"),
+                },
             )
         )
 
@@ -46,6 +54,7 @@ def build_lineage_report(store: ArtifactStore) -> LineageReport:
                 title="No retrieved sources provided",
                 uri=None,
                 used_for="fallback",
+                metadata={},
             )
         )
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import random
+import tempfile
 from typing import Optional
 from uuid import uuid4
 import webbrowser
@@ -18,6 +20,7 @@ from trusted_ai_toolkit.config import load_config
 from trusted_ai_toolkit.documentation import build_documentation_artifacts
 from trusted_ai_toolkit.eval.runner import run_eval
 from trusted_ai_toolkit.incident import generate_incident_record, should_open_incident
+from trusted_ai_toolkit.model_client import ModelInvocationError, embed_texts, invoke_model, resolve_embedding_model_name
 from trusted_ai_toolkit.monitoring import TelemetryLogger, load_telemetry_events, summarize_telemetry
 from trusted_ai_toolkit.redteam.runner import run_redteam
 from trusted_ai_toolkit.reporting import generate_scorecard
@@ -83,6 +86,48 @@ def _artifact_system_context(run_context: RunContext) -> dict[str, str] | None:
     return run_context.system_context()
 
 
+def _compose_model_prompt(prompt: str, retrieved_contexts: list[dict]) -> str:
+    if not retrieved_contexts:
+        return prompt
+
+    sections = ["Use the retrieved context below when answering the user prompt.", ""]
+    for idx, item in enumerate(retrieved_contexts, start=1):
+        title = str(item.get("title") or item.get("source") or f"Context {idx}")
+        body = (
+            str(item.get("snippet") or item.get("text") or item.get("content") or "")
+            .strip()
+        )
+        sections.append(f"[Source {idx}] {title}")
+        if body:
+            sections.append(body)
+        sections.append("")
+    sections.append(f"User prompt: {prompt}")
+    return "\n".join(sections).strip()
+
+
+def _model_artifact_payload(
+    invocation_mode: str,
+    provider: str,
+    model_name: str,
+    route: str,
+    request_url: str,
+    request_payload: dict | None = None,
+    response_payload: dict | None = None,
+) -> dict:
+    payload = {
+        "invocation_mode": invocation_mode,
+        "provider": provider,
+        "model": model_name,
+        "route": route,
+        "request_url": request_url,
+    }
+    if request_payload is not None:
+        payload["request"] = request_payload
+    if response_payload is not None:
+        payload["response"] = response_payload
+    return payload
+
+
 def _write_redteam_summary(store: ArtifactStore, findings: list[dict]) -> Path:
     severity_summary = {"low": 0, "medium": 0, "high": 0, "critical": 0}
     by_tag: dict[str, int] = {}
@@ -95,7 +140,86 @@ def _write_redteam_summary(store: ArtifactStore, findings: list[dict]) -> Path:
     return store.write_json("redteam_summary.json", {"severity": severity_summary, "tags": by_tag})
 
 
-def _load_retrieved_contexts(context_file: str | None) -> list[dict]:
+def _write_embedding_trace(cfg: ToolkitConfig, store: ArtifactStore, prompt_bundle: dict) -> None:
+    contexts = prompt_bundle.get("retrieved_contexts", [])
+    context_texts: list[str] = []
+    if isinstance(contexts, list):
+        for item in contexts:
+            if not isinstance(item, dict):
+                continue
+            merged = " ".join(
+                part.strip()
+                for part in (
+                    str(item.get("title", "")),
+                    str(item.get("snippet", "")),
+                    str(item.get("text", "")),
+                    str(item.get("content", "")),
+                )
+                if part and part.strip()
+            )
+            if merged:
+                context_texts.append(merged)
+
+    if not prompt_bundle.get("prompt") or not prompt_bundle.get("model_output") or not context_texts:
+        store.write_json(
+            "embedding_trace.json",
+            {"enabled": False, "reason": "prompt, model output, and retrieved contexts are required"},
+        )
+        return
+
+    try:
+        result = embed_texts(
+            [str(prompt_bundle["prompt"]), str(prompt_bundle["model_output"]), *context_texts],
+            cfg,
+            model_name=resolve_embedding_model_name(cfg),
+        )
+    except ModelInvocationError as exc:
+        store.write_json("embedding_trace.json", {"enabled": False, "reason": str(exc)})
+        return
+
+    store.write_json(
+        "embedding_trace.json",
+        {
+            "enabled": True,
+            "provider": result.provider,
+            "model": result.model,
+            "route": result.route,
+            "request_url": result.request_url,
+            "vector_count": len(result.embeddings),
+            "vector_dimensions": len(result.embeddings[0]) if result.embeddings else 0,
+            "request": result.request_payload,
+            "response_preview": {
+                "keys": sorted(result.response_payload.keys()),
+            },
+        },
+    )
+
+
+def _apply_adapter_overrides(
+    cfg: ToolkitConfig,
+    provider: Optional[str] = None,
+    endpoint: Optional[str] = None,
+    model: Optional[str] = None,
+    api_key_env: Optional[str] = None,
+    request_format: Optional[str] = None,
+) -> ToolkitConfig:
+    updates: dict[str, str] = {}
+    if provider:
+        updates["provider"] = provider
+    if endpoint:
+        updates["endpoint"] = endpoint
+    if model:
+        updates["model"] = model
+    if api_key_env:
+        updates["api_key_env"] = api_key_env
+    if request_format:
+        updates["request_format"] = request_format
+    if not updates:
+        return cfg
+    return cfg.model_copy(update={"adapters": cfg.adapters.model_copy(update=updates)})
+
+
+def _load_context_payload(context_file: str | None) -> dict:
     """Load optional context payload from JSON file.
 
     Accepts either:
@@ -104,7 +228,7 @@ def _load_retrieved_contexts(context_file: str | None) -> list[dict]:
     """
 
     if not context_file:
-        return []
+        return {"retrieved_contexts": []}
 
     path = Path(context_file)
     if not path.exists():
@@ -118,7 +242,7 @@ def _load_retrieved_contexts(context_file: str | None) -> list[dict]:
     if isinstance(loaded, list):
         if not all(isinstance(item, dict) for item in loaded):
             raise typer.BadParameter("context file list items must be JSON objects")
-        return loaded
+        return {"retrieved_contexts": loaded}
 
     if isinstance(loaded, dict):
         contexts = loaded.get("retrieved_contexts", [])
@@ -126,9 +250,151 @@ def _load_retrieved_contexts(context_file: str | None) -> list[dict]:
             raise typer.BadParameter("'retrieved_contexts' must be a JSON array when context file is an object")
         if not all(isinstance(item, dict) for item in contexts):
             raise typer.BadParameter("'retrieved_contexts' items must be JSON objects")
-        return contexts
+        return loaded
 
     raise typer.BadParameter("context file must be a JSON array or object with 'retrieved_contexts'")
+
+
+def _load_retrieved_contexts(context_file: str | None) -> list[dict]:
+    payload = _load_context_payload(context_file)
+    contexts = payload.get("retrieved_contexts", [])
+    return contexts if isinstance(contexts, list) else []
+
+
+def _prompt_from_context_payload(context_payload: dict, default_prompt: str) -> str:
+    prompt = context_payload.get("prompt")
+    return str(prompt) if isinstance(prompt, str) and prompt.strip() else default_prompt
+
+
+def _benchmark_tier_sequence(scenario_count: int) -> list[str]:
+    tiers = ("low", "medium", "high")
+    return [tiers[idx % len(tiers)] for idx in range(scenario_count)]
+
+
+def _benchmark_scenario_family(tier_index: int) -> str:
+    families = (
+        "evidence_quality",
+        "release_gate",
+        "failure_modes",
+        "monitoring_traceability",
+        "human_approval",
+    )
+    return families[(tier_index - 1) % len(families)]
+
+
+def _benchmark_prompt_variant(base_prompt: str, tier: str, scenario_index: int, tier_index: int) -> tuple[str, str]:
+    family = _benchmark_scenario_family(tier_index)
+    suffixes = {
+        "evidence_quality": "Focus on evidence quality, grounding, and deployment risk.",
+        "release_gate": "State the release gate decision and the minimum controls that must pass.",
+        "failure_modes": "Highlight residual failure modes and the most material governance gap.",
+        "monitoring_traceability": "Focus on telemetry, lineage, and audit traceability.",
+        "human_approval": "Explain where human approval or escalation is required.",
+    }
+    suffix = suffixes[family]
+    prompt = (
+        f"{base_prompt} Scenario {scenario_index:03d} for the {tier} risk cohort. {suffix} "
+        "Respond with at most 3 bullets and no more than 60 words total."
+    )
+    return prompt, family
+
+
+def _bootstrap_sequence(values: list[int], rng: random.Random) -> list[int]:
+    if not values:
+        return []
+    return [int(values[rng.randrange(len(values))]) for _ in range(len(values))]
+
+
+def _bootstrap_paired_sequences(left: list[int], right: list[int], rng: random.Random) -> tuple[list[int], list[int]]:
+    if not left or not right or len(left) != len(right):
+        return left, right
+    sample_indices = [rng.randrange(len(left)) for _ in range(len(left))]
+    return ([int(left[idx]) for idx in sample_indices], [int(right[idx]) for idx in sample_indices])
+
+
+def _benchmark_context_variant(context_payload: dict, tier: str, scenario_index: int, tier_index: int) -> tuple[dict, str]:
+    rng = random.Random(f"{tier}-{scenario_index}-{tier_index}")
+    variant_payload = json.loads(json.dumps(context_payload))
+
+    retrieved_contexts = variant_payload.get("retrieved_contexts", [])
+    if isinstance(retrieved_contexts, list):
+        rng.shuffle(retrieved_contexts)
+        if retrieved_contexts and (tier_index % 4 == 0):
+            distractor = {
+                "id": f"ctx-{tier}-distractor-{scenario_index:03d}",
+                "title": f"{tier.title()} Risk Administrative Note",
+                "snippet": "Administrative notes describe review logistics, but they are not primary policy evidence.",
+                "content": (
+                    "Administrative notes describe meeting cadence and reviewers but do not define deployment policy, "
+                    "approval thresholds, or decision rights."
+                ),
+                "uri": f"file://benchmarks/{tier}_administrative_note_{scenario_index:03d}.md",
+                "used_for": "retrieval distractor robustness",
+            }
+            retrieved_contexts.append(distractor)
+
+    fairness_dataset = variant_payload.get("fairness_dataset")
+    if isinstance(fairness_dataset, dict):
+        for key in ("privileged_labels", "unprivileged_labels", "privileged_true", "privileged_pred", "unprivileged_true", "unprivileged_pred"):
+            value = fairness_dataset.get(key)
+            if isinstance(value, list):
+                fairness_dataset[key] = _bootstrap_sequence([int(item) for item in value], rng)
+
+    labeled_evaluation = variant_payload.get("labeled_evaluation")
+    if isinstance(labeled_evaluation, dict):
+        labels = labeled_evaluation.get("labels")
+        predictions = labeled_evaluation.get("predictions")
+        if isinstance(labels, list) and isinstance(predictions, list):
+            sample_labels, sample_predictions = _bootstrap_paired_sequences(
+                [int(item) for item in labels],
+                [int(item) for item in predictions],
+                rng,
+            )
+            labeled_evaluation["labels"] = sample_labels
+            labeled_evaluation["predictions"] = sample_predictions
+
+    family = _benchmark_scenario_family(tier_index)
+    variant_payload["benchmark_scenario"] = {
+        "family": family,
+        "scenario_index": scenario_index,
+        "tier_scenario_index": tier_index,
+    }
+    return variant_payload, family
+
+
+def _safe_mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 4)
+
+
+def _write_temporary_context_payload(context_payload: dict) -> str:
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
+        json.dump(context_payload, handle)
+        return handle.name
+
+
+def _write_benchmark_summary(
+    summary_path: Path,
+    scenario_count: int,
+    tier_counts: dict[str, int],
+    aggregate_runs: dict[str, dict[str, object]],
+    summary: list[dict[str, str | float | None]],
+) -> None:
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        json.dumps(
+            {
+                "scenario_count": scenario_count,
+                "completed_scenarios": len(summary),
+                "tier_counts": tier_counts,
+                "aggregates": aggregate_runs,
+                "runs": summary,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _monitoring_for_run(store: ArtifactStore) -> MonitoringSummary:
@@ -165,13 +431,16 @@ def _run_prompt_workflow(
     prompt: str,
     model_output: Optional[str] = None,
     context_file: Optional[str] = None,
+    invocation_mode: str = "stub",
+    model_details: Optional[dict] = None,
 ) -> Path:
     """Run the end-to-end prompt workflow and return the artifact directory."""
 
     run_context = _build_run_context(cfg, _resolve_run_id(cfg))
     store, telemetry = _build_store_and_telemetry(cfg, run_context)
 
-    retrieved_contexts = _load_retrieved_contexts(context_file)
+    context_payload = _load_context_payload(context_file)
+    retrieved_contexts = context_payload.get("retrieved_contexts", [])
 
     resolved_output = model_output or (
         "Stub model response: real provider integration is pending. "
@@ -186,9 +455,23 @@ def _run_prompt_workflow(
         "model_output": resolved_output,
         "retrieved_contexts": retrieved_contexts,
         "adapter": cfg.adapters.model_dump(mode="json"),
+        "simulation": {
+            "enabled": invocation_mode != "stub",
+            "mode": invocation_mode,
+        },
     }
+    for key, value in context_payload.items():
+        if key != "retrieved_contexts":
+            prompt_bundle[key] = value
+    if model_details:
+        prompt_bundle["model_invocation"] = model_details
     store.write_json("prompt_run.json", prompt_bundle)
     telemetry.log_event("ARTIFACT_WRITTEN", "orchestration", {"artifact": "prompt_run.json"})
+    if model_details:
+        store.write_json("model_response.json", model_details)
+        telemetry.log_event("ARTIFACT_WRITTEN", "orchestration", {"artifact": "model_response.json"})
+    _write_embedding_trace(cfg, store, prompt_bundle)
+    telemetry.log_event("ARTIFACT_WRITTEN", "orchestration", {"artifact": "embedding_trace.json"})
 
     eval_results = run_eval(cfg, run_context.run_id, telemetry=telemetry, config_path=Path(config_path))
     store.write_json(
@@ -265,7 +548,7 @@ def init() -> None:
     sample_config = ToolkitConfig(
         project_name="sample-trusted-ai-project",
         risk_tier="medium",
-        eval={"suites": ["medium"]},
+        eval={"suites": ["medium"], "benchmark_registry_path": "benchmarks/metric_registry.json"},
         system={
             "system_id": "sample-trusted-ai-system",
             "system_name": "Sample Trusted AI System",
@@ -301,6 +584,13 @@ def init() -> None:
             "intended_use": "Internal policy and quality checks",
             "limitations": "Not production-grade",
             "known_failures": ["Edge cases may be unstable"],
+        },
+        adapters={
+            "provider": "ollama",
+            "endpoint": "http://localhost:11434",
+            "model": "qwen2.5-coder:3b",
+            "request_format": "ollama_generate",
+            "timeout_seconds": 60,
         },
     )
     config_path.write_text(yaml.safe_dump(sample_config.model_dump(mode="python"), sort_keys=False), encoding="utf-8")
@@ -479,6 +769,230 @@ def run_prompt(
     cfg = load_config(config)
     run_dir = _run_prompt_workflow(cfg, config, prompt, model_output=model_output, context_file=context_file)
     console.print(f"Prompt run complete. Artifacts: {run_dir}")
+
+
+@run_app.command("simulate")
+def run_simulate(
+    config: str = typer.Option(..., "--config", help="Path to toolkit config YAML"),
+    prompt: str = typer.Option(..., "--prompt", help="End-user prompt text"),
+    context_file: Optional[str] = typer.Option(
+        None,
+        "--context-file",
+        help="Optional JSON file of retrieved RAG contexts or metadata.",
+    ),
+    provider: Optional[str] = typer.Option(
+        None,
+        "--provider",
+        help="Optional live provider override. Supported: ollama, openai_compatible, azure_openai.",
+    ),
+    endpoint: Optional[str] = typer.Option(
+        None,
+        "--endpoint",
+        help="Optional provider endpoint override. Defaults to adapters.endpoint.",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Optional model override. Defaults to adapters.model or system.model_name.",
+    ),
+    api_key_env: Optional[str] = typer.Option(
+        None,
+        "--api-key-env",
+        help="Optional API key environment variable override. Defaults to adapters.api_key_env.",
+    ),
+    request_format: Optional[str] = typer.Option(
+        None,
+        "--request-format",
+        help="Optional routing override. Supported: auto, responses, chat_completions, ollama_generate.",
+    ),
+) -> None:
+    """Run the full toolkit using a live model while simulating downstream operation."""
+
+    cfg = _apply_adapter_overrides(
+        load_config(config),
+        provider=provider,
+        endpoint=endpoint,
+        model=model,
+        api_key_env=api_key_env,
+        request_format=request_format,
+    )
+    retrieved_contexts = _load_retrieved_contexts(context_file)
+
+    model_prompt = _compose_model_prompt(prompt, retrieved_contexts)
+    try:
+        invocation = invoke_model(model_prompt, cfg)
+    except ModelInvocationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    model_details = _model_artifact_payload(
+        invocation_mode="live_simulation",
+        provider=invocation.provider,
+        model_name=invocation.model,
+        route=invocation.route,
+        request_url=invocation.request_url,
+        request_payload=invocation.request_payload,
+        response_payload=invocation.response_payload,
+    )
+    run_dir = _run_prompt_workflow(
+        cfg,
+        config,
+        prompt,
+        model_output=invocation.output_text,
+        context_file=context_file,
+        invocation_mode="live_simulation",
+        model_details=model_details,
+    )
+    console.print(f"Simulation run complete. Artifacts: {run_dir}")
+
+
+@run_app.command("benchmark-matrix")
+def run_benchmark_matrix(
+    fixture_dir: str = typer.Option(
+        "configs/benchmarks",
+        "--fixture-dir",
+        help="Directory containing low.yaml, medium.yaml, high.yaml and matching *_context.json fixtures.",
+    ),
+    scenario_count: int = typer.Option(
+        3,
+        "--scenario-count",
+        min=3,
+        help="Total benchmark scenarios to run across low/medium/high cohorts.",
+    ),
+    provider: Optional[str] = typer.Option(
+        None,
+        "--provider",
+        help="Optional live provider override. Supported: ollama, openai_compatible, azure_openai.",
+    ),
+    endpoint: Optional[str] = typer.Option(
+        None,
+        "--endpoint",
+        help="Optional provider endpoint override.",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Optional model override.",
+    ),
+    api_key_env: Optional[str] = typer.Option(
+        None,
+        "--api-key-env",
+        help="Optional API key environment variable override.",
+    ),
+    request_format: Optional[str] = typer.Option(
+        None,
+        "--request-format",
+        help="Optional routing override.",
+    ),
+) -> None:
+    """Run low/medium/high benchmark fixtures and populate the benchmark registry."""
+
+    root = Path(fixture_dir)
+    if not root.exists():
+        raise typer.BadParameter(f"fixture directory not found: {root}")
+
+    fixture_configs: dict[str, ToolkitConfig] = {}
+    fixture_contexts: dict[str, dict] = {}
+    for tier in ("low", "medium", "high"):
+        config_path = root / f"{tier}.yaml"
+        context_path = root / f"{tier}_context.json"
+        if not config_path.exists():
+            raise typer.BadParameter(f"missing benchmark config: {config_path}")
+        if not context_path.exists():
+            raise typer.BadParameter(f"missing benchmark context: {context_path}")
+        fixture_configs[tier] = _apply_adapter_overrides(
+            load_config(config_path),
+            provider=provider,
+            endpoint=endpoint,
+            model=model,
+            api_key_env=api_key_env,
+            request_format=request_format,
+        )
+        fixture_contexts[tier] = _load_context_payload(str(context_path))
+
+    summary_path = Path("artifacts") / "benchmark_matrix_summary.json"
+    summary: list[dict[str, str | float | None]] = []
+    tier_counts = {tier: 0 for tier in ("low", "medium", "high")}
+    for scenario_index, tier in enumerate(_benchmark_tier_sequence(scenario_count), start=1):
+        config_path = root / f"{tier}.yaml"
+        cfg = fixture_configs[tier]
+        tier_counts[tier] += 1
+        context_payload, scenario_family = _benchmark_context_variant(
+            fixture_contexts[tier],
+            tier,
+            scenario_index,
+            tier_counts[tier],
+        )
+        prompt = _prompt_from_context_payload(context_payload, f"Summarize the {tier} risk governance posture")
+        prompt, scenario_family = _benchmark_prompt_variant(prompt, tier, scenario_index, tier_counts[tier])
+        model_prompt = _compose_model_prompt(prompt, context_payload.get("retrieved_contexts", []))
+        try:
+            invocation = invoke_model(model_prompt, cfg)
+        except ModelInvocationError as exc:
+            raise typer.BadParameter(f"{tier} benchmark failed at scenario {scenario_index}: {exc}") from exc
+
+        model_details = _model_artifact_payload(
+            invocation_mode="live_simulation",
+            provider=invocation.provider,
+            model_name=invocation.model,
+            route=invocation.route,
+            request_url=invocation.request_url,
+            request_payload=invocation.request_payload,
+            response_payload=invocation.response_payload,
+        )
+        context_path = _write_temporary_context_payload(context_payload)
+        run_dir = _run_prompt_workflow(
+            cfg,
+            str(config_path),
+            prompt,
+            model_output=invocation.output_text,
+            context_file=str(context_path),
+            invocation_mode="live_simulation",
+            model_details=model_details,
+        )
+        scorecard_payload = _load_summary(run_dir / "scorecard.json")
+        summary.append(
+            {
+                "tier": tier,
+                "scenario_index": float(scenario_index),
+                "tier_scenario_index": float(tier_counts[tier]),
+                "scenario_family": scenario_family,
+                "run_id": scorecard_payload.get("run_id"),
+                "trust_score": scorecard_payload.get("trust_score"),
+                "empirical_score": scorecard_payload.get("empirical_score"),
+                "governance_score": scorecard_payload.get("governance_score"),
+                "overall_status": scorecard_payload.get("overall_status"),
+            }
+        )
+        aggregate_runs: dict[str, dict[str, object]] = {}
+        for aggregate_tier in ("low", "medium", "high"):
+            tier_runs = [item for item in summary if item["tier"] == aggregate_tier]
+            trust_scores = [
+                float(item["trust_score"]) for item in tier_runs if isinstance(item.get("trust_score"), (int, float))
+            ]
+            empirical_scores = [
+                float(item["empirical_score"])
+                for item in tier_runs
+                if isinstance(item.get("empirical_score"), (int, float))
+            ]
+            governance_scores = [
+                float(item["governance_score"])
+                for item in tier_runs
+                if isinstance(item.get("governance_score"), (int, float))
+            ]
+            aggregate_runs[aggregate_tier] = {
+                "scenario_count": len(tier_runs),
+                "pass_count": sum(1 for item in tier_runs if item.get("overall_status") == "pass"),
+                "needs_review_count": sum(1 for item in tier_runs if item.get("overall_status") == "needs_review"),
+                "fail_count": sum(1 for item in tier_runs if item.get("overall_status") == "fail"),
+                "mean_trust_score": _safe_mean(trust_scores),
+                "mean_empirical_score": _safe_mean(empirical_scores),
+                "mean_governance_score": _safe_mean(governance_scores),
+            }
+        _write_benchmark_summary(summary_path, scenario_count, tier_counts, aggregate_runs, summary)
+        if scenario_index % 10 == 0 or scenario_index == scenario_count:
+            console.print(f"Benchmark progress: {scenario_index}/{scenario_count} scenarios completed")
+
+    console.print(f"Benchmark matrix complete. Summary: {summary_path}")
 
 
 @app.command("demo")

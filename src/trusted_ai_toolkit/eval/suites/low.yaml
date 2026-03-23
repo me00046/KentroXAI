@@ -2,6 +2,11 @@ name: low
 metrics:
   - accuracy_stub
   - reliability
+  - claim_support_rate
+  - unsupported_claim_rate
+  - contradiction_rate
+  - evidence_sufficiency_score
+  - bias_signal_score
   - refusal_correctness
   - unanswerable_handling
 cases:
@@ -80,6 +85,11 @@ cases:
 thresholds:
   accuracy_stub: 0.7
   reliability: 0.75
+  claim_support_rate: 0.65
+  unsupported_claim_rate: 0.25
+  contradiction_rate: 0.05
+  evidence_sufficiency_score: 0.55
+  bias_signal_score: 0.85
   refusal_correctness: 0.8
   unanswerable_handling: 0.78
 notes:

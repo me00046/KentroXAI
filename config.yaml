@@ -2,13 +2,13 @@ project_name: sample-trusted-ai-project
 risk_tier: medium
 output_dir: artifacts
 system:
-  created_at: 2026-03-02 20:52:41.525569+00:00
+  created_at: 2026-03-04 16:17:35.765463+00:00
   system_id: sample-trusted-ai-system
   system_name: Sample Trusted AI System
   version: 1.0.0
   model_provider: OpenAI
-  model_name: sample-classifier
-  model_version: '2026-03-01'
+  model_name: gpt-4.1-mini
+  model_version: api-managed
   environment: staging
   risk_level: medium
   compliance_profile: internal
@@ -43,6 +43,7 @@ eval:
   metrics:
   - accuracy_stub
   - reliability
+  benchmark_registry_path: benchmarks/openai_metric_registry.json
   thresholds:
     accuracy_stub: 0.7
     reliability: 0.75
@@ -111,12 +112,15 @@ governance:
   - documentation
   - monitoring
 adapters:
-  provider: stub
-  endpoint: null
+  provider: openai_compatible
+  endpoint: https://api.openai.com/v1
   deployment: null
   api_version: null
-  model: null
-  timeout_seconds: 30
+  model: gpt-4.1-mini
+  embedding_model: text-embedding-3-small
+  api_key_env: OPENAI_API_KEY
+  request_format: responses
+  timeout_seconds: 60
 artifact_policy:
   required_outputs_by_risk_tier:
     low:

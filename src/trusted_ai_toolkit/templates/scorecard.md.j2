@@ -1,4 +1,4 @@
-# Release Readiness Scorecard
+# Answer Trust Card
 
 {% set display_risk_tier = deployment_risk_tier or risk_tier %}
 
@@ -6,12 +6,28 @@
 **Run ID:** {{ run_id }}  
 **Deployment Risk:** {{ display_risk_tier | title }}  
 **Control-Derived Tier:** {{ risk_tier }}  
+**Answer Verdict:** {{ answer_verdict | replace("_", " ") | title if answer_verdict else "Unknown" }}  
+**Answer Trust Score:** {{ answer_trust_score_pct if answer_trust_score_pct is not none else "N/A" }}%  
 **Overall Status:** {{ overall_status | replace("_", " ") | title }}  
 **Go/No-Go:** {{ go_no_go | upper }}
 
 ## Executive Summary
 
 {{ executive_summary }}
+
+## Answer Truth Summary
+
+- Claim support rate: {{ answer_truth_summary.claim_support_rate if answer_truth_summary.claim_support_rate is not none else "N/A" }}
+- Unsupported claim rate: {{ answer_truth_summary.unsupported_claim_rate if answer_truth_summary.unsupported_claim_rate is not none else "N/A" }}
+- Contradiction rate: {{ answer_truth_summary.contradiction_rate if answer_truth_summary.contradiction_rate is not none else "N/A" }}
+- Evidence sufficiency score: {{ answer_truth_summary.evidence_sufficiency_score if answer_truth_summary.evidence_sufficiency_score is not none else "N/A" }}
+- Bias risk: {{ bias_assessment.risk | title if bias_assessment.risk else "Unknown" }}
+
+## Why This Verdict
+
+{% for reason in answer_reasons %}
+- {{ reason }}
+{% endfor %}
 
 ## Stage Gate Status
 
@@ -25,10 +41,13 @@
 - Completeness: {{ evidence_completeness }}%
 - Required Outputs: {{ required_outputs | length }}
 
-## Pillar Scores
+## Trust Math
 
 {% if pillar_scores %}
-- Raw trust score (pre-penalty): {{ raw_trust_score_pct }}%
+- Trust z-score: {{ trust_score }}
+- Answer trust score: {{ answer_trust_score_pct }}%
+- Empirical quality score: {{ empirical_score_pct }}%
+- Governance score (pre-penalty): {{ raw_trust_score_pct }}%
 - Release readiness (after penalties): {{ release_readiness_score_pct }}%
 - Security: {{ "%.0f"|format(pillar_scores.security * 100) }}%
 - Reliability: {{ "%.0f"|format(pillar_scores.reliability * 100) }}%
@@ -37,6 +56,12 @@
 {% else %}
 - Not available
 {% endif %}
+
+## Weighting Rationale
+
+{% for pillar, weight in weighting_rationale.items() %}
+- {{ pillar }} weight: {{ "%.0f"|format(weight * 100) }}%
+{% endfor %}
 
 ## Responsible AI Dimension Status
 

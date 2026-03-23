@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Trust Score Card</title>
+  <title>Answer Trust Card</title>
   <style>
     :root {
       --bg: #f3f5f7;
@@ -704,14 +704,14 @@
               </div>
             </div>
             {% endif %}
-            <p class="brand-tag">Trusted AI Review</p>
+            <p class="brand-tag">Answer Trust Review</p>
           </div>
         </div>
         <p class="evidence">Evidence Pack: {{ run_id }}</p>
       </div>
 
       <div class="chips">
-        <span class="chip pass hint" title="This is the governance gate outcome. It tells you whether the required checks passed, are blocked, or still need review.">{{ policy_text }}</span>
+        <span class="chip pass hint" title="This is the answer-level trust verdict for the current response.">{{ answer_verdict | replace("_", " ") | title if answer_verdict else policy_text }}</span>
         <span class="chip blue hint" title="This shows how complete the evidence pack is compared with the list of required artifacts for this run.">{{ artifact_signal.evidence_label }}</span>
         <span class="chip purple hint" title="Configured risk is the declared risk level for this use case. It is set in configuration and does not change based on the score.">Configured Risk {{ pedigree }}</span>
         <span class="chip amber hint" title="Traceability shows whether this run includes system context and telemetry fields that let you trace the result back to a specific governed system.">{{ artifact_signal.trace_label }}</span>
@@ -722,9 +722,9 @@
         <div class="score-wrap">
           <div class="ring">
             <p class="num">{{ card_score.display_score_pct if card_score.display_score_pct is not none else "N/A" }}</p>
-            <p class="label">{{ card_score.label }}</p>
+            <p class="label">Answer Trust</p>
           </div>
-          <p class="ring-note hint" title="The trust score is built from the baseline trust inputs shown in the panel to the right.">This score reflects confidence in this answer.</p>
+          <p class="ring-note hint" title="The displayed score is the answer-level trust score derived from supported claims, unsupported claims, contradictions, and evidence sufficiency.">This score reflects confidence in this answer.</p>
           <div class="score-sidecard">
             <div class="mini-section">
               <p class="tier-label hint" title="Deployment risk is the declared risk category for the system or use case. It is chosen in configuration and represents the intended operating context.">Deployment Risk</p>
@@ -735,8 +735,8 @@
             </div>
 
             <div class="mini-section">
-              <p class="minor-label hint" title="Decision status is the final governance outcome for this run: pass, needs review, or fail. It is separate from the trust score.">Decision Status</p>
-              <p class="minor-value">{{ overall_status | replace("_", " ") | title }}</p>
+              <p class="minor-label hint" title="Answer verdict tells the user whether this specific answer should be trusted, used cautiously, or not trusted.">Answer Verdict</p>
+              <p class="minor-value">{{ answer_verdict | replace("_", " ") | title if answer_verdict else "Unknown" }}</p>
 
               <p class="review-note{% if overall_status == "pass" %} pass{% elif overall_status == "needs_review" %} review{% endif %}">{{ card_score.status_note }}</p>
               {% if gate_ns.blocking_gates %}
@@ -800,13 +800,28 @@ block_on_high_severity = {{ "true" if redteam_gate_rules.block_on_high_severity 
 
         <div class="detail-panel">
           <div class="detail-group">
-            <h3>Why This Score</h3>
+            <h3>Why This Verdict</h3>
             <ul>
-              <li>Baseline trust: {{ card_score.control_score_pct if card_score.control_score_pct is not none else "N/A" }} from the four trust pillars.</li>
-              <li>Displayed trust score: {{ card_score.display_score_pct if card_score.display_score_pct is not none else "N/A" }} after modest reductions for failed checks or serious findings.</li>
+              <li>Answer trust score: {{ answer_trust_score_pct if answer_trust_score_pct is not none else "N/A" }} from claim support, unsupported-claim rate, contradiction rate, and evidence sufficiency.</li>
+              <li>Claim support rate: {{ answer_truth_summary.claim_support_rate if answer_truth_summary.claim_support_rate is not none else "N/A" }}.</li>
+              <li>Unsupported claim rate: {{ answer_truth_summary.unsupported_claim_rate if answer_truth_summary.unsupported_claim_rate is not none else "N/A" }}.</li>
+              <li>Contradiction rate: {{ answer_truth_summary.contradiction_rate if answer_truth_summary.contradiction_rate is not none else "N/A" }}.</li>
+              <li>Evidence sufficiency score: {{ answer_truth_summary.evidence_sufficiency_score if answer_truth_summary.evidence_sufficiency_score is not none else "N/A" }}.</li>
+              <li>Bias risk: {{ bias_assessment.risk | title if bias_assessment.risk else "Unknown" }}{% if bias_assessment.signal_terms %} ({{ bias_assessment.signal_terms | join(", ") }}){% endif %}.</li>
+              <li>Trust z-score: {{ trust_score_z if trust_score_z is not none else "N/A" }} keeps the historical cohort comparison for audit and benchmarking.</li>
+              <li>Governance score: {{ card_score.control_score_pct if card_score.control_score_pct is not none else "N/A" }} from the four trust pillars.</li>
               <li>Security {{ "%.0f"|format(pillar_scores.security * 100) if pillar_scores else "N/A" }}%, Reliability {{ "%.0f"|format(pillar_scores.reliability * 100) if pillar_scores else "N/A" }}%, Transparency {{ "%.0f"|format(pillar_scores.transparency * 100) if pillar_scores else "N/A" }}%, Governance {{ "%.0f"|format(pillar_scores.governance * 100) if pillar_scores else "N/A" }}%.</li>
               <li>Evidence completeness: {{ "%.0f"|format(evidence_completeness) }}%.</li>
               <li>Governance blockers are still shown separately and can still change the final decision status.</li>
+            </ul>
+          </div>
+
+          <div class="detail-group">
+            <h3>Answer Checks</h3>
+            <ul>
+              {% for reason in answer_reasons %}
+              <li>{{ reason }}</li>
+              {% endfor %}
             </ul>
           </div>
 
@@ -833,12 +848,16 @@ block_on_high_severity = {{ "true" if redteam_gate_rules.block_on_high_severity 
           <div class="detail-group">
             <h3>Baseline Trust Inputs</h3>
             <p class="breakdown-note">Expand a pillar to see the formula, weighting, and contribution to the trust score.</p>
+            <ul class="pillar-meta">
+              <li>Weighting policy: Security {{ "%.0f"|format(weighting_rationale.security * 100) }}%, Reliability {{ "%.0f"|format(weighting_rationale.reliability * 100) }}%, Transparency {{ "%.0f"|format(weighting_rationale.transparency * 100) }}%, Governance {{ "%.0f"|format(weighting_rationale.governance * 100) }}%.</li>
+            </ul>
             <div>
               {% if pillar_breakdowns %}
               {% for pillar_name, breakdown in pillar_breakdowns.items() %}
               <details class="pillar-detail">
                 <summary class="pillar-summary">{{ pillar_name | title }}: {{ "%.0f"|format(breakdown.pillar_score * 100) }}%</summary>
                 <ul class="pillar-meta">
+                  <li>Formula: {{ breakdown.formula }}</li>
                   {% if breakdown.redteam_pass_rate is defined %}
                   <li>Why it looks different: security blends weighted controls with red-team results.</li>
                   <li>Weighted controls: {{ breakdown.control_weight_passed|round(0)|int }} of {{ breakdown.control_weight_total|round(0)|int }} control points passed = {{ "%.0f"|format(breakdown.control_pass_rate * 100) if breakdown.control_pass_rate is not none else "N/A" }}%</li>
